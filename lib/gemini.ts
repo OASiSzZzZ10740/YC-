@@ -24,9 +24,24 @@ export async function askGemini(faq: string, question: string, deadline: number,
     });
     return extractReply(result);
   } catch (error) {
-    errorType = error instanceof Error ? error.name : 'UnknownError';
-    return default_reply;
-  } finally {
+  const details =
+    typeof error === 'object' && error !== null
+      ? (error as { status?: unknown })
+      : undefined;
+
+  const httpStatus =
+    typeof details?.status === 'number' ? details.status : null;
+
+  errorType = error instanceof Error ? error.name : 'UnknownError';
+
+  console.error('gemini_request_failed', {
+    eventId,
+    httpStatus,
+    errorType,
+  });
+
+  return default_reply;
+} finally {
     console.info('gemini_request', { eventId, finishReason: result?.candidates?.[0]?.finishReason ?? null, thoughtsTokenCount: result?.usageMetadata?.thoughtsTokenCount ?? null, candidatesTokenCount: result?.usageMetadata?.candidatesTokenCount ?? null, errorType });
   }
 }

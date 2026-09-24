@@ -47,7 +47,15 @@ export async function getFaq(deadline: number): Promise<string> {
   const remaining = Math.min(2000, deadline - Date.now());
   if (remaining <= 0) throw new Error('sheet_timeout');
   const response = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(remaining) });
-  if (!response.ok) throw new Error('sheet_http_error');
+  if (!response.ok) {
+  console.error('sheet_fetch_failed', {
+    status: response.status,
+    statusText: response.statusText,
+    hostname: new URL(url).hostname,
+  });
+
+  throw new Error('sheet_http_error');
+}
   const csv = parseFaq(await response.text());
   cache = { url, csv, expires: Date.now() + 60_000 };
   return csv;

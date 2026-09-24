@@ -11,6 +11,19 @@ import { resolveHandoff } from '../lib/handoff';
 import { claimEvent } from '../lib/dedupe';
 import { processEvent, services } from '../lib/webhook';
 import { POST } from '../app/api/line-webhook/route';
+import { parse } from 'csv-parse/sync';
+
+test('Thai FAQ preserves all source fields and routes escalation levels', () => {
+  const header = 'รหัส,หมวดหมู่,ช่วงชั้น,คำถามตัวอย่าง,คำตอบสำหรับนักเรียน,การตอบสนองเริ่มต้น,เงื่อนไขและการส่งต่อ (ผู้ดูแล)';
+  const csv = header + '\n' + ['ทั่วไป', 'ส่งต่อ', 'เร่งด่วน', 'ฉุกเฉิน'].map((level, i) => `${i},หมวด,ทุกช่วงชั้น,คำถาม,คำตอบ,${level},เงื่อนไข`).join('\n');
+  const rows = parse(parseFaq(csv), { columns: true }) as Record<string, string>[];
+  assert.deepEqual(rows.map(r => r.action), ['answer', 'handoff', 'handoff', 'handoff']);
+  assert.equal(rows[3].response_level, 'ฉุกเฉิน');
+  assert.equal(rows[0].handoff_conditions, 'เงื่อนไข');
+  assert.equal(rows[0].grade, 'ทุกช่วงชั้น');
+  assert.equal(rows[0].answer, 'คำตอบ');
+  assert.throws(() => parseFaq(csv.replace('ฉุกเฉิน', 'unknown')), /invalid_sheet_response_level/);
+});
 
 test('CSV preserves quoted commas and newlines, excludes disabled rows', () => {
   const result = parseFaq('id,question,keywords,answer,action,enabled\n1,hello,,"a,b\nc",answer,TRUE\n2,hidden,,secret,answer,FALSE');

@@ -16,7 +16,11 @@ export async function processEvent(event: webhook.Event, deadline: number, reply
   try {
     const faq = await deps.getFaq(deadline - 2500);
     text = await deps.askGemini(faq, event.message.text, deadline - 2500, eventId);
-  } catch { console.warn('faq_or_ai_unavailable', { eventId }); }
+  } catch (error) {
+    const knownReasons = ['invalid_sheet_schema', 'invalid_sheet_row', 'invalid_sheet_response_level', 'empty_sheet_answer', 'empty_sheet', 'missing_sheet_url', 'sheet_timeout', 'sheet_http_error'];
+    const reason = error instanceof Error && knownReasons.includes(error.message) ? error.message : 'sheet_fetch_or_parse_error';
+    console.warn('faq_or_ai_unavailable', { eventId, reason });
+  }
   if (text === default_reply) {
     text = await deps.resolveHandoff({ eventId, userId: event.source?.userId, message: event.message.text, deadline: deadline - 1500 });
   }

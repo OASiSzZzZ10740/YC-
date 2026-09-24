@@ -24,6 +24,7 @@ export async function askGemini(faq: string, question: string, deadline: number,
   systemInstruction,
   maxOutputTokens: 1024,
 },    
+    });
     return extractReply(result);
   } catch (error) {
   const details =

@@ -6,7 +6,7 @@ import type { webhook } from '@line/bot-sdk';
 import { parseFaq } from '../lib/sheet';
 import { buildContents, systemInstruction } from '../lib/prompt';
 import { extractReply, askGemini } from '../lib/gemini';
-import { default_reply, handoffSuccess, handoffUnavailable } from '../lib/messages';
+import { default_reply, handoffSuccess, handoffUnavailable, serviceUnavailable, safeResponseUnavailable } from '../lib/messages';
 import { resolveHandoff } from '../lib/handoff';
 import { claimEvent } from '../lib/dedupe';
 import { processEvent, services } from '../lib/webhook';
@@ -39,14 +39,16 @@ test('prompt places FAQ first and escapes injected closing tags', () => {
   assert.ok(systemInstruction.includes('งด emoji และมุกตลกในเรื่องจริงจัง'));
 });
 test('MAX_TOKENS, empty and blocked outputs never reach students', () => {
-  for (const finishReason of [FinishReason.MAX_TOKENS, FinishReason.SAFETY, undefined]) {
-    assert.equal(extractReply({ candidates: [{ finishReason, content: { parts: [{ text: 'partial' }] } }] } as GenerateContentResponse), default_reply);
+  for (const finishReason of [FinishReason.MAX_TOKENS, undefined]) {
+    assert.equal(extractReply({ candidates: [{ finishReason, content: { parts: [{ text: 'partial' }] } }] } as GenerateContentResponse), serviceUnavailable);
   }
+  assert.equal(extractReply({ candidates: [{ finishReason: FinishReason.SAFETY, content: { parts: [{ text: 'blocked' }] } }] } as GenerateContentResponse), safeResponseUnavailable);
   assert.equal(extractReply({ candidates: [{ finishReason: FinishReason.STOP, content: { parts: [{ thought: true, text: 'private' }, { text: 'สวัสดี' }] } }] } as GenerateContentResponse), 'สวัสดี');
-  assert.equal(extractReply({ candidates: [] } as unknown as GenerateContentResponse), default_reply);
+  assert.equal(extractReply({ candidates: [] } as unknown as GenerateContentResponse), serviceUnavailable);
+  assert.equal(extractReply({ candidates: [{ finishReason: FinishReason.STOP, content: { parts: [{ text: 'x'.repeat(4501) }] } }] } as GenerateContentResponse), serviceUnavailable);
 });
 test('expired Gemini budget falls back without a network request', async () => {
-  assert.equal(await askGemini('faq', 'q', Date.now() - 1, 'timeout-test'), default_reply);
+  assert.equal(await askGemini('faq', 'q', Date.now() - 1, 'timeout-test'), serviceUnavailable);
 });
 test('handoff confirms only acknowledged delivery', async () => {
   const request = { eventId: 'handoff-test', message: 'q', deadline: Date.now() + 1000 };
@@ -66,12 +68,67 @@ test('webhook signature verification and empty verification events', async () =>
   assert.equal((await POST(new Request('http://localhost/api/line-webhook', { method: 'POST', body, headers: { 'x-line-signature': signature } }))).status, 200);
   assert.equal((await POST(new Request('http://localhost/api/line-webhook', { method: 'POST', body }))).status, 401);
 });
-test('Sheet outage triggers handoff, FAQ answers reply directly, LINE failures are not retried', async () => {
+test('Sheet outage still uses AI, answers reply directly, LINE failures are not retried', async () => {
   const event = { type: 'message', mode: 'active', webhookEventId: 'flow', replyToken: 'test', source: { type: 'user', userId: 'test' }, message: { type: 'text', text: 'question' } } as webhook.Event;
   let replies = 0; let handoffs = 0;
   const deps = { ...services, claimEvent: () => true, getFaq: async () => 'faq', askGemini: async () => 'answer', resolveHandoff: async () => { handoffs++; return handoffUnavailable; } };
   await processEvent(event, Date.now() + 5000, async (_, text) => { replies++; assert.equal(text, 'answer'); }, deps);
   assert.equal(handoffs, 0);
-  await processEvent(event, Date.now() + 5000, async () => { replies++; throw new Error('network'); }, { ...deps, getFaq: async () => { throw new Error('sheet'); } });
-  assert.equal(handoffs, 1); assert.equal(replies, 2);
+  let aiCalls = 0;
+  await processEvent(event, Date.now() + 5000, async (_, text) => { replies++; assert.equal(text, 'general answer'); throw new Error('network'); }, {
+    ...deps,
+    getFaq: async () => { throw new Error('sheet'); },
+    askGemini: async (faq, question) => {
+      aiCalls++;
+      assert.equal(faq, '');
+      assert.equal(question, 'question');
+      return 'general answer';
+    },
+  });
+  assert.equal(aiCalls, 1); assert.equal(handoffs, 0); assert.equal(replies, 2);
+});
+
+test('greetings, paraphrases and non-FAQ questions reach AI unchanged', async () => {
+  const questions = ['สวัสดี', 'อยากคุยด้วย', 'ไม่มีใครคบเลยอะ', 'ช่วยจัดตารางอ่านหนังสือ', 'ทำไมท้องฟ้าถึงเป็นสีฟ้า'];
+  for (const [i, question] of questions.entries()) {
+    const event = { type: 'message', mode: 'active', webhookEventId: `natural-${i}`, replyToken: 'test', message: { type: 'text', text: question } } as webhook.Event;
+    let replies = 0;
+    await processEvent(event, Date.now() + 5000, async (_, text) => {
+      replies++;
+      assert.equal(text, `response-${i}`);
+    }, {
+      ...services,
+      claimEvent: () => true,
+      getFaq: async () => 'unrelated school FAQ',
+      askGemini: async (faq, actualQuestion) => {
+        assert.equal(faq, 'unrelated school FAQ');
+        assert.equal(actualQuestion, question);
+        return `response-${i}`;
+      },
+      resolveHandoff: async () => { assert.fail('ordinary conversation must not trigger handoff'); },
+    });
+    assert.equal(replies, 1);
+  }
+});
+
+test('technical failures and legacy reply text never trigger a teacher handoff', async () => {
+  const event = { type: 'message', mode: 'active', webhookEventId: 'no-false-handoff', replyToken: 'test', message: { type: 'text', text: 'สวัสดี' } } as webhook.Event;
+  for (const expected of [serviceUnavailable, default_reply]) {
+    await processEvent(event, Date.now() + 5000, async (_, text) => { assert.equal(text, expected); }, {
+      ...services,
+      claimEvent: () => true,
+      getFaq: async () => '',
+      askGemini: async () => { if (expected === serviceUnavailable) throw new Error('API failure'); return default_reply; },
+      resolveHandoff: async () => { assert.fail('reply text is not a routing signal'); },
+    });
+  }
+});
+
+test('prompt permits general advice while retaining school and safety boundaries', () => {
+  assert.ok(systemInstruction.includes('ตอบด้วยความรู้ทั่วไปได้แม้ไม่มีเรื่องนั้นใน FAQ'));
+  assert.ok(systemInstruction.includes('ไม่ต้องใช้คำตรงกับคำถามตัวอย่าง'));
+  assert.ok(systemInstruction.includes('ข้อเท็จจริงเฉพาะโรงเรียน'));
+  assert.ok(systemInstruction.includes('ระบบยังไม่ได้เชื่อมส่งเรื่องให้ครู'));
+  assert.ok(systemInstruction.includes('ไม่บังคับติดต่อผู้ปกครองถ้าผู้ปกครองอาจเป็นผู้ทำร้าย'));
+  assert.ok(!systemInstruction.includes(default_reply));
 });

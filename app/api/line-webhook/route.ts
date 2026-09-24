@@ -3,10 +3,11 @@ import { processEvent } from '../../../lib/webhook';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-export const maxDuration = 10;
+export const maxDuration = 30;
 
 export async function POST(request: Request) {
-  const deadline = Date.now() + 9500;
+  // Leave room for generated advice, while keeping a bounded LINE reply budget.
+  const deadline = Date.now() + 25000;
   const secret = process.env.LINE_CHANNEL_SECRET;
   if (!secret) return Response.json({ error: 'Server configuration missing' }, { status: 503 });
   const raw = await request.text();

@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": false, "module": "commonjs", "moduleResolution": "node", "incremental": false, "outDir": "work/tests", "rootDir": ".", "isolatedModules": false },
+  "include": ["tests/**/*.ts", "lib/**/*.ts", "app/api/line-webhook/route.ts"],
+  "exclude": ["node_modules", "work"]
+}

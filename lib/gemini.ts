@@ -20,8 +20,10 @@ export async function askGemini(faq: string, question: string, deadline: number,
     const ai = new GoogleGenAI({ apiKey });
     result = await ai.models.generateContent({
       model: 'gemini-3.5-flash', contents: buildContents(faq, question),
-      config: { systemInstruction, temperature: 1.0, maxOutputTokens: 1024, abortSignal: AbortSignal.timeout(remaining), httpOptions: { timeout: remaining, retryOptions: { attempts: 1 } } },
-    });
+  config: {
+  systemInstruction,
+  maxOutputTokens: 1024,
+},    
     return extractReply(result);
   } catch (error) {
   const details =

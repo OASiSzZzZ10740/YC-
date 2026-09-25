@@ -1,0 +1,308 @@
+diff --git a/README.md b/README.md
+index 49cf170..363621c 100644
+--- a/README.md
++++ b/README.md
+@@ -35,7 +35,7 @@ Google Sheet ต้องเผยแพร่เป็น CSV ผ่าน HTTP
+ - `lib/handoff.ts`: เก็บจุดเชื่อมระบบรับเรื่องไว้สำหรับอนาคต แต่ยังไม่มีระบบส่งต่อจริงและเส้นทางแชตไม่เรียก adapter นี้อัตโนมัติ Gemini ทำได้เพียงแนะนำให้ผู้ใช้ติดต่อคนที่ช่วยได้
+ - `lib/dedupe.ts`: กัน event ซ้ำภายใน instance เป็นเวลา 24 ชั่วโมง
+ 
+-ตั้งเวลาทำงานรวมสูงสุดเป้าหมาย 25 วินาที ภายใต้ Vercel maxDuration 30 วินาที เพื่อให้ AI มีเวลาสร้างคำตอบมากกว่าข้อจำกัดเดิม 10 วินาที โดย Sheet ไม่เกิน 2 วินาที สงวน 2.5 วินาทีสำหรับตอบ LINE Gemini ยกเลิกด้วย AbortSignal และไม่ retry อัตโนมัติ LINE SDK ไม่รองรับ AbortSignal จึงหยุดรอเมื่อถึงเวลา แต่คำขอที่ส่งแล้วอาจยังทำงานต่อ ห้าม retry reply token ที่ไม่ทราบผลส่ง ระบบ log ความล้มเหลวแล้วตอบรับ webhook เพื่อไม่ตอบซ้ำโดยไม่ทราบผล
++ตั้งเวลาทำงานรวมสูงสุดเป้าหมาย 25 วินาที ภายใต้ Vercel maxDuration 30 วินาที เพื่อให้ AI มีเวลาสร้างคำตอบมากกว่าข้อจำกัดเดิม 10 วินาที โดย Sheet ไม่เกิน 2 วินาที สงวน 2.5 วินาทีสำหรับตอบ LINE Gemini จำกัดแต่ละครั้งไม่เกิน 10 วินาที และยกเลิกด้วย AbortSignal ลองได้สูงสุด 3 ครั้งเฉพาะข้อผิดพลาดชั่วคราว (408, 429, 500, 502, 503, 504 และ timeout) โดยหน่วง 0.5/1 วินาทีพร้อม jitter ไม่เกิน 249 ms และต้องเหลือเวลาอย่างน้อย 1 วินาทีหลังหน่วง ทุกครั้งใช้ deadline รวมเดิมและปิด retry ภายใน SDK หากยังล้มเหลวใช้ข้อความระบบขัดข้องเดิม ไม่ retry ข้อผิดพลาดการตั้งค่า/สิทธิ์ คำตอบถูกบล็อก หรือคำตอบไม่สมบูรณ์ Log เพิ่มชื่อโมเดล จำนวนครั้ง และระยะเวลา โดยไม่บันทึก prompt, API key หรือข้อความนักเรียน LINE SDK ไม่รองรับ AbortSignal จึงหยุดรอเมื่อถึงเวลา แต่คำขอที่ส่งแล้วอาจยังทำงานต่อ ห้าม retry reply token ที่ไม่ทราบผลส่ง ระบบ log ความล้มเหลวแล้วตอบรับ webhook เพื่อไม่ตอบซ้ำโดยไม่ทราบผล
+ 
+ ## สิ่งที่ต้องเชื่อมก่อนใช้งานเต็มรูปแบบ
+ 
+diff --git a/lib/gemini.ts b/lib/gemini.ts
+index 6f80f16..dfb7bd7 100644
+--- a/lib/gemini.ts
++++ b/lib/gemini.ts
+@@ -1,8 +1,44 @@
+-import { GoogleGenAI, type GenerateContentResponse } from '@google/genai';
++import { GoogleGenAI, type GenerateContentParameters, type GenerateContentResponse } from '@google/genai';
+ import { safeResponseUnavailable, serviceUnavailable } from './messages';
+ import { beforeDeadline } from './deadline';
+ import { buildContents, systemInstruction } from './prompt';
+ 
++const MODEL = 'gemini-3.5-flash';
++const MAX_ATTEMPTS = 3;
++const ATTEMPT_TIMEOUT_MS = 10_000;
++const MIN_RETRY_BUDGET_MS = 1_000;
++
++type GeminiDependencies = {
++  generateContent: (params: GenerateContentParameters) => Promise<GenerateContentResponse>;
++  now: () => number;
++  sleep: (ms: number) => Promise<void>;
++  random: () => number;
++};
++
++const defaults: GeminiDependencies = {
++  generateContent: params => {
++    const apiKey = process.env.GEMINI_API_KEY;
++    if (!apiKey) throw new Error('configuration');
++    return new GoogleGenAI({ apiKey }).models.generateContent(params);
++  },
++  now: () => Date.now(),
++  sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
++  random: () => Math.random(),
++};
++
++function httpStatus(error: unknown): number | null {
++  const status = typeof error === 'object' && error !== null && 'status' in error ? error.status : null;
++  return typeof status === 'number' ? status : null;
++}
++
++function isTransient(error: unknown): boolean {
++  const status = httpStatus(error);
++  if (status !== null) return [408, 429, 500, 502, 503, 504].includes(status);
++  return error instanceof Error && (
++    error.name === 'TimeoutError' || error.name === 'AbortError' || error.message === 'deadline_exceeded'
++  );
++}
++
+ export function extractReply(response: GenerateContentResponse): string {
+   const candidate = response.candidates?.[0];
+   if (response.promptFeedback?.blockReason || candidate?.finishReason === 'SAFETY') return safeResponseUnavailable;
+@@ -11,33 +47,65 @@ export function extractReply(response: GenerateContentResponse): string {
+   return text && text.length <= 4500 ? text : serviceUnavailable;
+ }
+ 
+-export async function askGemini(faq: string, question: string, deadline: number, eventId: string): Promise<string> {
++export async function askGemini(
++  faq: string, question: string, deadline: number, eventId: string,
++  deps: GeminiDependencies = defaults,
++): Promise<string> {
++  const started = deps.now();
+   let result: GenerateContentResponse | undefined;
+   let errorType: string | null = null;
++  let attempts = 0;
+   try {
+-    const remaining = deadline - Date.now();
+-    if (remaining <= 0) throw new Error('deadline');
+-    const apiKey = process.env.GEMINI_API_KEY;
+-    if (!apiKey) throw new Error('configuration');
+-    const ai = new GoogleGenAI({ apiKey });
+-    result = await beforeDeadline(ai.models.generateContent({
+-      model: 'gemini-3.5-flash', contents: buildContents(faq, question),
+-      config: {
+-        systemInstruction,
+-        maxOutputTokens: 2048,
+-        abortSignal: AbortSignal.timeout(remaining),
+-        httpOptions: { timeout: remaining, retryOptions: { attempts: 1 } },
+-      },
+-    }), deadline);
+-    return extractReply(result);
++    const contents = buildContents(faq, question);
++    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
++      const remaining = deadline - deps.now();
++      if (remaining <= 0) throw new Error('deadline_exceeded');
++      attempts = attempt;
++      const timeout = Math.min(ATTEMPT_TIMEOUT_MS, remaining);
++      const attemptDeadline = Math.min(deadline, deps.now() + timeout);
++      const controller = new AbortController();
++      const timer = setTimeout(() => controller.abort(), timeout);
++      let failure: unknown;
++      try {
++        result = await beforeDeadline(deps.generateContent({
++          model: MODEL, contents,
++          config: {
++            systemInstruction,
++            maxOutputTokens: 2048,
++            abortSignal: controller.signal,
++            // This loop owns retries so SDK backoff cannot consume the LINE reply budget.
++            httpOptions: { timeout, retryOptions: { attempts: 1 } },
++          },
++        }), attemptDeadline);
++        return extractReply(result);
++      } catch (error) {
++        failure = error;
++      } finally {
++        clearTimeout(timer);
++        controller.abort();
++      }
++
++      const delayMs = 500 * 2 ** (attempt - 1) + Math.floor(deps.random() * 250);
++      if (!isTransient(failure) || attempt === MAX_ATTEMPTS ||
++          deadline - deps.now() < delayMs + MIN_RETRY_BUDGET_MS) throw failure;
++      console.warn('gemini_request_retry', {
++        eventId, model: MODEL, attempt, httpStatus: httpStatus(failure), delayMs,
++      });
++      await beforeDeadline(deps.sleep(delayMs), deadline);
++    }
++    return serviceUnavailable;
+   } catch (error) {
+-    const details = typeof error === 'object' && error !== null
+-      ? (error as { status?: unknown }) : undefined;
+-    const httpStatus = typeof details?.status === 'number' ? details.status : null;
+     errorType = error instanceof Error ? error.name : 'UnknownError';
+-    console.error('gemini_request_failed', { eventId, httpStatus, errorType });
++    console.error('gemini_request_failed', {
++      eventId, model: MODEL, attempts, httpStatus: httpStatus(error), errorType,
++    });
+     return serviceUnavailable;
+   } finally {
+-    console.info('gemini_request', { eventId, finishReason: result?.candidates?.[0]?.finishReason ?? null, thoughtsTokenCount: result?.usageMetadata?.thoughtsTokenCount ?? null, candidatesTokenCount: result?.usageMetadata?.candidatesTokenCount ?? null, errorType });
++    console.info('gemini_request', {
++      eventId, model: MODEL, attempts, durationMs: deps.now() - started,
++      finishReason: result?.candidates?.[0]?.finishReason ?? null,
++      thoughtsTokenCount: result?.usageMetadata?.thoughtsTokenCount ?? null,
++      candidatesTokenCount: result?.usageMetadata?.candidatesTokenCount ?? null, errorType,
++    });
+   }
+ }
+diff --git a/tests/bot.test.ts b/tests/bot.test.ts
+index 55ff97e..004256a 100644
+--- a/tests/bot.test.ts
++++ b/tests/bot.test.ts
+@@ -132,3 +132,153 @@ test('prompt permits general advice while retaining school and safety boundaries
+   assert.ok(systemInstruction.includes('ไม่บังคับติดต่อผู้ปกครองถ้าผู้ปกครองอาจเป็นผู้ทำร้าย'));
+   assert.ok(!systemInstruction.includes(default_reply));
+ });
++
++function geminiHarness(generate: NonNullable<Parameters<typeof askGemini>[4]>['generateContent']) {
++  let now = Date.now();
++  const delays: number[] = [];
++  return {
++    deps: {
++      generateContent: generate,
++      now: () => now,
++      sleep: async (ms: number) => { delays.push(ms); now += ms; },
++      random: () => 0,
++    },
++    delays,
++    advance: (ms: number) => { now += ms; },
++  };
++}
++const completeAnswer = { candidates: [{ finishReason: FinishReason.STOP, content: { parts: [{ text: 'answer' }] } }] } as GenerateContentResponse;
++const apiFailure = (status: number) => Object.assign(new Error('upstream unavailable'), { name: 'ApiError', status });
++
++test('Gemini recovers from 503 then 504 with bounded backoff and unchanged prompt', async () => {
++  const requests: import('@google/genai').GenerateContentParameters[] = [];
++  const harness = geminiHarness(async params => {
++    requests.push(params);
++    if (requests.length < 3) throw apiFailure(requests.length === 1 ? 503 : 504);
++    return completeAnswer;
++  });
++  assert.equal(await askGemini('faq', 'question', Date.now() + 22500, 'retry-success', harness.deps), 'answer');
++  assert.deepEqual(harness.delays, [500, 1000]);
++  assert.equal(requests.length, 3);
++  for (const request of requests) {
++    assert.equal(request.model, 'gemini-3.5-flash');
++    assert.equal(request.contents, buildContents('faq', 'question'));
++    assert.equal(request.config?.systemInstruction, systemInstruction);
++    assert.equal(request.config?.httpOptions?.retryOptions?.attempts, 1);
++    assert.ok(request.config!.httpOptions!.timeout! <= 10000);
++    assert.ok(request.config?.abortSignal?.aborted);
++  }
++});
++
++test('Gemini stops after three transient failures', async () => {
++  let calls = 0;
++  const harness = geminiHarness(async () => { calls++; throw apiFailure(503); });
++  assert.equal(await askGemini('', 'q', Date.now() + 22500, 'retry-limit', harness.deps), serviceUnavailable);
++  assert.equal(calls, 3);
++  assert.deepEqual(harness.delays, [500, 1000]);
++});
++
++test('Gemini does not retry permanent errors or unknown exceptions', async () => {
++  for (const error of [apiFailure(400), apiFailure(401), apiFailure(403), apiFailure(404), new Error('configuration')]) {
++    let calls = 0;
++    const harness = geminiHarness(async () => { calls++; throw error; });
++    assert.equal(await askGemini('', 'q', Date.now() + 22500, 'permanent', harness.deps), serviceUnavailable);
++    assert.equal(calls, 1);
++    assert.deepEqual(harness.delays, []);
++  }
++});
++
++test('Gemini retries rate limits and timeouts while budget remains', async () => {
++  for (const error of [apiFailure(429), apiFailure(500), apiFailure(502), Object.assign(new Error('timeout'), { name: 'TimeoutError' })]) {
++    let calls = 0;
++    const harness = geminiHarness(async () => { if (++calls === 1) throw error; return completeAnswer; });
++    assert.equal(await askGemini('', 'q', Date.now() + 22500, 'transient', harness.deps), 'answer');
++    assert.equal(calls, 2);
++  }
++});
++
++test('Gemini shortens the next attempt to the remaining budget', async () => {
++  const timeouts: number[] = [];
++  const harness = geminiHarness(async params => {
++    timeouts.push(params.config!.httpOptions!.timeout!);
++    if (timeouts.length === 1) { harness.advance(10000); throw apiFailure(504); }
++    return completeAnswer;
++  });
++  assert.equal(await askGemini('', 'q', harness.deps.now() + 18000, 'remaining', harness.deps), 'answer');
++  assert.deepEqual(timeouts, [10000, 7500]);
++});
++
++test('Gemini skips retries if backoff would leave too little response time', async () => {
++  let calls = 0;
++  const harness = geminiHarness(async () => { calls++; harness.advance(9500); throw apiFailure(504); });
++  assert.equal(await askGemini('', 'q', harness.deps.now() + 10000, 'no-time', harness.deps), serviceUnavailable);
++  assert.equal(calls, 1);
++  assert.deepEqual(harness.delays, []);
++});
++
++test('Gemini aborts a hung request and returns fallback at its deadline', async () => {
++  let signal: AbortSignal | undefined;
++  let calls = 0;
++  const harness = geminiHarness(params => {
++    calls++;
++    signal = params.config?.abortSignal;
++    return new Promise<GenerateContentResponse>(() => {});
++  });
++  harness.deps.now = () => Date.now();
++  const started = Date.now();
++  assert.equal(await askGemini('', 'q', started + 30, 'hung', harness.deps), serviceUnavailable);
++  assert.ok(signal?.aborted);
++  assert.equal(calls, 1);
++  assert.ok(Date.now() - started < 1000);
++});
++
++test('Gemini does not retry safety blocks or incomplete generated answers', async () => {
++  for (const finishReason of [FinishReason.SAFETY, FinishReason.MAX_TOKENS]) {
++    let calls = 0;
++    const harness = geminiHarness(async () => {
++      calls++;
++      return { candidates: [{ finishReason }] } as GenerateContentResponse;
++    });
++    assert.equal(await askGemini('', 'q', Date.now() + 22500, 'blocked', harness.deps),
++      finishReason === FinishReason.SAFETY ? safeResponseUnavailable : serviceUnavailable);
++    assert.equal(calls, 1);
++  }
++});
++
++test('expired Gemini deadline makes no generation call', async () => {
++  const harness = geminiHarness(async () => { assert.fail('must not call Gemini'); });
++  assert.equal(await askGemini('', 'q', Date.now() - 1, 'expired', harness.deps), serviceUnavailable);
++});
++
++test('real Gemini SDK surfaces 503 and application retry recovers', async t => {
++  const previousKey = process.env.GEMINI_API_KEY;
++  process.env.GEMINI_API_KEY = 'fake-test-key';
++  t.after(() => {
++    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
++    else process.env.GEMINI_API_KEY = previousKey;
++  });
++  let calls = 0;
++  t.mock.method(globalThis, 'fetch', async () => {
++    calls++;
++    if (calls === 1) return Response.json({ error: { code: 503, message: 'Unavailable', status: 'UNAVAILABLE' } }, { status: 503 });
++    return Response.json(completeAnswer);
++  });
++  assert.equal(await askGemini('faq', 'q', Date.now() + 5000, 'sdk-retry'), 'answer');
++  assert.equal(calls, 2);
++});
++
++test('exhausted Gemini retries still produce exactly one LINE reply', async () => {
++  const event = { type: 'message', mode: 'active', webhookEventId: 'retry-flow', replyToken: 'test', message: { type: 'text', text: 'q' } } as webhook.Event;
++  let calls = 0;
++  let replies = 0;
++  const harness = geminiHarness(async () => { calls++; throw apiFailure(503); });
++  await processEvent(event, Date.now() + 25000, async (_, text) => {
++    replies++;
++    assert.equal(text, serviceUnavailable);
++  }, {
++    ...services, claimEvent: () => true, getFaq: async () => 'faq',
++    askGemini: (faq, question, deadline, eventId) => askGemini(faq, question, deadline, eventId, harness.deps),
++  });
++  assert.equal(calls, 3);
++  assert.equal(replies, 1);
++});
